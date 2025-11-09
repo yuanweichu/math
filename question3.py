@@ -12,6 +12,11 @@ PRICE_GRID = 1.0
 PRICE_PV = 0.4
 PRICE_Wind = 0.5
 
+# 储能投资成本
+COST_P_ES = 800.0  # 功率成本 (元/kW)
+COST_E_ES = 1800.0  # 能量成本 (元/kWh)
+LIFESPAN_DAYS = 10 * 365  # 寿命 (天)
+
 # 附件文件名
 FILE_LOAD = "附件1：各园区典型日负荷数据.xlsx"
 FILE_GEN = "附件2：各园区典型日风光发电数据.xlsx"
@@ -36,72 +41,219 @@ df['Wind_B_pu'] = pd.to_numeric(df_gen_pu[2])
 df['PV_C_pu'] = pd.to_numeric(df_gen_pu[3])
 df['Wind_C_pu'] = pd.to_numeric(df_gen_pu[4])
 
-# --- 3. 计算“联合园区”的 总负荷 和 总发电 ---
+# --- 3. 计算基础数据 (净负荷) ---
+df['Gen_A'] = df['PV_A_pu'] * CAP_PV_A
+df['Net_Load_A'] = df['Load_A'] - df['Gen_A']
 
-# (复用问题1的代码，计算各园区的发电)
-df['Gen_PV_A'] = df['PV_A_pu'] * CAP_PV_A
-df['Gen_Wind_B'] = df['Wind_B_pu'] * CAP_Wind_B
+df['Gen_B'] = df['Wind_B_pu'] * CAP_Wind_B
+df['Net_Load_B'] = df['Load_B'] - df['Gen_B']
+
 df['Gen_PV_C'] = df['PV_C_pu'] * CAP_PV_C
 df['Gen_Wind_C'] = df['Wind_C_pu'] * CAP_Wind_C
+df['Gen_C_Total'] = df['Gen_PV_C'] + df['Gen_Wind_C']
+df['Net_Load_C'] = df['Load_C'] - df['Gen_C_Total']
 
-# --- 这部分是问题2(1)的核心 ---
-# (1) 计算联合总负荷
-df['Load_Total'] = df['Load_A'] + df['Load_B'] + df['Load_C']
-
-# (2) 计算联合总光伏发电
-df['Gen_PV_Total'] = df['Gen_PV_A'] + df['Gen_PV_C']
-
-# (3) 计算联合总风电发电
-df['Gen_Wind_Total'] = df['Gen_Wind_B'] + df['Gen_Wind_C']
-
-# (4) 计算联合总发电
-df['Gen_Total'] = df['Gen_PV_Total'] + df['Gen_Wind_Total']
-# --- 核心结束 ---
+zero_series = pd.Series(np.zeros(24))
 
 
-# --- 4. 联合园区 “无储能” 经济性分析 (同问题1(1)的逻辑) ---
+# --- 4. 关键函数：储能模拟 (已修复) ---
 
-# (1) 计算联合园区的净负荷
-df['Net_Load_Total'] = df['Load_Total'] - df['Gen_Total']
+def analyze_doc_with_storage(load_series, pv_gen_series, wind_gen_series, p_cap, e_cap):
+    """
+    计算给定(P, E)配置下的“日运行成本(DOC)”。
+    """
+    p_es = p_cap
+    e_es = e_cap
+    soc_min = e_es * 0.1
+    soc_max = e_es * 0.9
+    eta = 0.95
 
-# (2) 计算联合园区的购电量 和 弃电量
-df['Grid_Buy_Total'] = np.where(df['Net_Load_Total'] > 0, df['Net_Load_Total'], 0)
-df['Curtail_Total'] = np.where(df['Net_Load_Total'] <= 0, -df['Net_Load_Total'], 0)
+    net_load_series = load_series - (pv_gen_series + wind_gen_series)
 
-# (3) 计算联合园区的实际使用量 (修正了图4的缺陷)
-# 弃电量需要按风光比例分摊
-total_gen = df['Gen_Total'].sum()
-total_pv_gen = df['Gen_PV_Total'].sum()
-total_wind_gen = df['Gen_Wind_Total'].sum()
-total_curtail = df['Curtail_Total'].sum()
+    if e_es <= 0 or p_es <= 0:
+        grid_buy = np.where(net_load_series > 0, net_load_series, 0).sum()
+        curtail = np.where(net_load_series <= 0, -net_load_series, 0).sum()
 
-# 计算风光在总弃电中的比例
-ratio_pv = np.divide(total_pv_gen, total_gen, out=np.zeros_like(total_pv_gen), where=total_gen > 0)
-ratio_wind = np.divide(total_wind_gen, total_gen, out=np.zeros_like(total_wind_gen), where=total_gen > 0)
+        gen_total = pv_gen_series.sum() + wind_gen_series.sum()
+        pv_gen = pv_gen_series.sum()
+        wind_gen = wind_gen_series.sum()
 
-# 实际使用量 = 总发电量 - 被弃掉的量
-total_pv_used = total_pv_gen - (total_curtail * ratio_pv)
-total_wind_used = total_wind_gen - (total_curtail * ratio_wind)
+        ratio_pv = np.divide(pv_gen, gen_total, out=np.zeros_like(pv_gen), where=gen_total > 0)
+        ratio_wind = np.divide(wind_gen, gen_total, out=np.zeros_like(wind_gen), where=gen_total > 0)
 
-# (4) 汇总计算联合园区的最终指标
-total_load_kwh = df['Load_Total'].sum()
-total_grid_buy_kwh = df['Grid_Buy_Total'].sum()
-total_curtail_kwh = df['Curtail_Total'].sum()
+        pv_used = pv_gen - (curtail * ratio_pv)
+        wind_used = wind_gen - (curtail * ratio_wind)
 
-# (5) 计算总成本
-cost_grid = total_grid_buy_kwh * PRICE_GRID
-cost_pv = total_pv_used * PRICE_PV
-cost_wind = total_wind_used * PRICE_Wind
-total_cost = cost_grid + cost_pv + cost_wind
+        doc = (grid_buy * PRICE_GRID) + (pv_used * PRICE_PV) + (wind_used * PRICE_Wind)
+        return {"doc": doc, "grid_buy": grid_buy, "curtail": curtail}
 
-# (6) 计算单位平均成本
-avg_cost = total_cost / total_load_kwh
+    soc = np.zeros(25)
+    soc[0] = soc_min
+    p_charge = np.zeros(24)
+    p_discharge = np.zeros(24)
+    grid_buy_new = np.zeros(24)
+    curtail_new = np.zeros(24)
+
+    for t in range(24):
+        net_load = net_load_series[t]
+        if net_load > 0:
+            max_can_discharge = min(p_es, (soc[t] - soc_min) * eta)
+            p_discharge[t] = min(max_can_discharge, net_load)
+            grid_buy_new[t] = net_load - p_discharge[t]
+        elif net_load < 0:
+            surplus = -net_load
+            max_can_charge = min(p_es, (soc_max - soc[t]) / eta)
+            p_charge[t] = min(max_can_charge, surplus)
+            curtail_new[t] = surplus - p_charge[t]
+        soc[t + 1] = soc[t] - (p_discharge[t] / eta) + (p_charge[t] * eta)
+
+    total_grid_buy_new = grid_buy_new.sum()
+    total_curtail_new = curtail_new.sum()
+    total_pv_gen = pv_gen_series.sum()
+    total_wind_gen = wind_gen_series.sum()
+    total_gen = total_pv_gen + total_wind_gen
+    ratio_pv = np.divide(total_pv_gen, total_gen, out=np.zeros_like(total_pv_gen), where=total_gen > 0)
+    ratio_wind = np.divide(total_wind_gen, total_gen, out=np.zeros_like(total_wind_gen), where=total_gen > 0)
+    total_pv_used_new = total_pv_gen - (total_curtail_new * ratio_pv)
+    total_wind_used_new = total_wind_gen - (total_curtail_new * ratio_wind)
+    doc = (total_grid_buy_new * PRICE_GRID) + (total_pv_used_new * PRICE_PV) + (total_wind_used_new * PRICE_Wind)
+
+    return {
+        "doc": doc,
+        "grid_buy": total_grid_buy_new,
+        "curtail": total_curtail_new
+    }
 
 
-# --- 5. 打印结果 ---
+def calculate_dic(p_cap, e_cap):
+    """计算日均投资成本(DIC)"""
+    return (p_cap * COST_P_ES + e_cap * COST_E_ES) / LIFESPAN_DAYS
+
+
+# --- 5. 新增：可复用的“遍历搜索”函数 (已修改) ---
+def find_optimal_config(load_series, pv_gen_series, wind_gen_series, p_range, e_range):
+    """
+    为单个园区执行遍历搜索，找到最优 P, E 配置
+    """
+    results = []
+    for p in p_range:
+        for e in e_range:
+            sim_result = analyze_doc_with_storage(load_series, pv_gen_series, wind_gen_series, p, e)
+            doc = sim_result['doc']
+            dic = calculate_dic(p, e)
+            tdc = doc + dic
+
+            # --- 这是本次修改的核心 ---
+            # 将 'grid_buy' 和 'curtail' 也保存到结果中
+            results.append({
+                'P_cap': p, 'E_cap': e, 'TDC': tdc, 'DOC': doc, 'DIC': dic,
+                'Grid_Buy': sim_result['grid_buy'],
+                'Curtail': sim_result['curtail']
+            })
+            # --- 修改结束 ---
+
+    df_results = pd.DataFrame(results)
+    # 找到TDC最小的行
+    optimal_config = df_results.loc[df_results['TDC'].idxmin()]
+    return optimal_config
+
+
+# --- 6. 主程序：(已修改) ---
+
 if __name__ == "__main__":
-    print("--- 问题2(1) 联合园区 (无储能) 经济性分析 ---")
-    print(f"联合总购电量:       {total_grid_buy_kwh:,.2f} kWh")
-    print(f"联合总弃风弃光电量: {total_curtail_kwh:,.2f} kWh")
-    print(f"联合总供电成本:     {total_cost:,.2f} 元")
-    print(f"联合单位平均成本:   {avg_cost:,.4f} 元/kWh")
+
+    print("--- 问题1(3) 最优储能配置分析 ---")
+    total_start_time = time.time()
+
+    # --- 搜索范围定义 ---
+    P_range = np.arange(0, 151, 10)  # 功率(kW): 从0到150, 步长10
+    E_range = np.arange(0, 301, 20)  # 容量(kWh): 从0到300, 步长20
+
+    # ----------------------------------------------------
+    # (1) 论证：50kW/100kWh 是否最优？
+    # ----------------------------------------------------
+    print("正在计算 50kW/100kWh 方案的TDC...")
+    dic_50 = calculate_dic(50, 100)  # 50/100的投资成本是固定的
+
+    doc_A_50 = analyze_doc_with_storage(df['Load_A'], df['Gen_A'], zero_series, 50, 100)['doc']
+    tdc_A_50 = doc_A_50 + dic_50
+    print(f"园区A (50/100) TDC: {tdc_A_50:,.2f} 元 (DOC: {doc_A_50:,.2f} + DIC: {dic_50:,.2f})")
+
+    doc_B_50 = analyze_doc_with_storage(df['Load_B'], zero_series, df['Gen_B'], 50, 100)['doc']
+    tdc_B_50 = doc_B_50 + dic_50
+    print(f"园区B (50/100) TDC: {tdc_B_50:,.2f} 元 (DOC: {doc_B_50:,.2f} + DIC: {dic_50:,.2f})")
+
+    doc_C_50 = analyze_doc_with_storage(df['Load_C'], df['Gen_PV_C'], df['Gen_Wind_C'], 50, 100)['doc']
+    tdc_C_50 = doc_C_50 + dic_50
+    print(f"园区C (50/100) TDC: {tdc_C_50:,.2f} 元 (DOC: {doc_C_50:,.2f} + DIC: {dic_50:,.2f})")
+
+    # ----------------------------------------------------
+    # (2) 寻找最优解 (为A, B, C分别执行)
+    # ----------------------------------------------------
+    print(f"\n正在执行遍历搜索 (P: {len(P_range)} 步, E: {len(E_range)} 步)...")
+
+    print("\n--- 正在优化 园区A ---")
+    start_A = time.time()
+    optimal_A = find_optimal_config(df['Load_A'], df['Gen_A'], zero_series, P_range, E_range)
+    print(f"搜索完成！用时 {time.time() - start_A:.2f} 秒")
+
+    print("\n--- 正在优化 园区B ---")
+    start_B = time.time()
+    optimal_B = find_optimal_config(df['Load_B'], zero_series, df['Gen_B'], P_range, E_range)
+    print(f"搜索完成！用时 {time.time() - start_B:.2f} 秒")
+
+    print("\n--- G正在优化 园区C ---")
+    start_C = time.time()
+    optimal_C = find_optimal_config(df['Load_C'], df['Gen_PV_C'], df['Gen_Wind_C'], P_range, E_range)
+    print(f"搜索完成！用时 {time.time() - start_C:.2f} 秒")
+
+    # ----------------------------------------------------
+    # (3) 打印最终的优化结果报告 (已修改)
+    # ----------------------------------------------------
+    print("\n\n" + "=" * 30)
+    print("--- 最终优化结果报告 ---")
+    print("=" * 30)
+
+    # --- 打印园区A的结果 (已修改) ---
+    print(f"\n[园区A 最优配置方案]")
+    print(f"最优功率: {optimal_A['P_cap']} kW, 最优容量: {optimal_A['E_cap']} kWh")
+    print(f"最低总成本 TDC: {optimal_A['TDC']:,.2f} 元")
+    print(f" (其中 DOC: {optimal_A['DOC']:,.2f} 元, DIC: {optimal_A['DIC']:,.2f} 元)")
+    # --- 新增行 ---
+    print(f" (最优方案详情: 购电 {optimal_A['Grid_Buy']:,.2f} kWh, 弃电 {optimal_A['Curtail']:,.2f} kWh)")
+
+    print(f"[论证 50/100 方案]: {tdc_A_50:,.2f} 元 > 最优方案 {optimal_A['TDC']:,.2f} 元。")
+    if tdc_A_50 > optimal_A['TDC']:
+        print("结论：50/100 方案不是最优方案。")
+    else:
+        print("结论：50/100 方案在搜索范围内是最优方案。")
+
+    # --- 打印园区B的结果 (已修改) ---
+    print(f"\n[园区B 最优配置方案]")
+    print(f"最优功率: {optimal_B['P_cap']} kW, 最优容量: {optimal_B['E_cap']} kWh")
+    print(f"最低总成本 TDC: {optimal_B['TDC']:,.2f} 元")
+    print(f" (其中 DOC: {optimal_B['DOC']:,.2f} 元, DIC: {optimal_B['DIC']:,.2f} 元)")
+    # --- 新增行 ---
+    print(f" (最优方案详情: 购电 {optimal_B['Grid_Buy']:,.2f} kWh, 弃电 {optimal_B['Curtail']:,.2f} kWh)")
+
+    print(f"[论证 50/100 方案]: {tdc_B_50:,.2f} 元 > 最优方案 {optimal_B['TDC']:,.2f} 元。")
+    if tdc_B_50 > optimal_B['TDC']:
+        print("结论：50/100 方案不是最优方案。")
+    else:
+        print("结论：50/100 方案在搜索范围内是最优方案。")
+
+    # --- 打印园区C的结果 (已修改) ---
+    print(f"\n[园区C 最优配置方案]")
+    print(f"最优功率: {optimal_C['P_cap']} kW, 最优容量: {optimal_C['E_cap']} kWh")
+    print(f"最低总成本 TDC: {optimal_C['TDC']:,.2f} 元")
+    print(f" (其中 DOC: {optimal_C['DOC']:,.2f} 元, DIC: {optimal_C['DIC']:,.2f} 元)")
+    # --- 新增行 ---
+    print(f" (最优方案详情: 购电 {optimal_C['Grid_Buy']:,.2f} kWh, 弃电 {optimal_C['Curtail']:,.2f} kWh)")
+
+    print(f"[论证 50/100 方案]: {tdc_C_50:,.2f} 元 > 最优方案 {optimal_C['TDC']:,.2f} 元。")
+    if tdc_C_50 > optimal_C['TDC']:
+        print("结论：50/100 方案不是最优方案。")
+    else:
+        print("结论：50/100 方案在搜索范围内是最优方案。")
+
+    print(f"\n--- 总用时: {time.time() - total_start_time:.2f} 秒 ---")
