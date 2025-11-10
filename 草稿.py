@@ -1,68 +1,68 @@
 import pandas as pd
 import numpy as np
 import time
-from scipy.optimize import differential_evolution
+import matplotlib.pyplot as plt  # 1. 导入图表库
 
-# --- 1. 定义常量 (严格忠实于 A 题 PDF) ---
-# [cite: 29, 37, 62, 102]
-PRICE_GRID = 1.0  # Q1/Q2 定义的网购电价 (用于峰时)
-PRICE_PV_OP = 0.4  # Q1/Q2 定义的光伏运行成本 (元/kWh)
-PRICE_WIND_OP = 0.5  # Q1/Q2 定义的风电运行成本 (元/kWh)
+# --- 1. 定义常量 ---
+CAP_PV_A = 750.0
+CAP_Wind_B = 1000.0
+CAP_PV_C = 600.0
+CAP_Wind_C = 500.0
 
-COST_PV_INV = 2500.0  # Q3 定义的光伏投资成本 (元/kW) [cite: 62]
-COST_WIND_INV = 3000.0  # Q3 定义的风电投资成本 (元/kW) [cite: 62]
-COST_P_ES = 800.0  # Page 1 定义的储能功率成本 (元/kW) [cite: 29]
-COST_E_ES = 1800.0  # Page 1 定义的储能能量成本 (元/kWh) [cite: 29]
+PRICE_GRID = 1.0
+PRICE_PV = 0.4
+PRICE_Wind = 0.5
 
-LIFESPAN_GEN = 5  # Q3 定义的风光回报期 (年) [cite: 62]
-LIFESPAN_ES = 10  # Page 1 定义的储能寿命 (年) [cite: 30]
+# 储能投资成本
+COST_P_ES = 800.0
+COST_E_ES = 1800.0
+LIFESPAN_DAYS = 10 * 365
 
-# (模型 [91b...] 提及的 r，我们必须假设一个)
-INTEREST_RATE = 0.08  # 假设一个标准的折现率 r
+# --- 设置 Matplotlib 中文字体 ---
+try:
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定默认字体为黑体
+    plt.rcParams['axes.unicode_minus'] = False  # 解决保存图像时负号'-'显示为方块的问题
+except Exception as e:
+    print(f"中文字体设置失败 (可能未安装 'SimHei')，图表标签可能显示异常: {e}")
 
-# --- 问题 3(2) 的新常量 [cite: 64, 66, 67] ---
+# 附件文件名
 FILE_LOAD = "附件1：各园区典型日负荷数据.xlsx"
-FILE_GEN_MONTHLY = "附件3：12个月各园区典型日风光发电数据.xlsx"
-
-# 分时电价 (TOU) 数组 (0点到23点) [cite: 67]
-TOU_PRICE_ARRAY = np.full(24, 0.4)  # 谷时 (其余时段)
-TOU_PRICE_ARRAY[7:23] = 1.0  # 峰时 (7:00-22:00)
-
-# 每月天数
-DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
+FILE_GEN = "附件2：各园区典型日风光发电数据.xlsx"
 
 # --- 2. 加载和准备数据 ---
 try:
-    df_load_raw = pd.read_excel(FILE_LOAD)
-    df_load = pd.DataFrame()
-    # 负荷增长 50% [cite: 62]
-    df_load['A'] = df_load_raw['园区A负荷(kW)'] * 1.5
-    df_load['B'] = df_load_raw['园区B负荷(kW)'] * 1.5
-    df_load['C'] = df_load_raw['园区C负荷(kW)'] * 1.5
-
-    # 附件3 [cite: 70]
-    df_gen_monthly_raw = pd.read_excel(FILE_GEN_MONTHLY, header=None, skiprows=4)
-
+    df_load = pd.read_excel(FILE_LOAD)
+    df_gen_pu = pd.read_excel(FILE_GEN, header=None, skiprows=3)
 except Exception as e:
     print(f"数据加载失败: {e}")
     exit()
 
+# 准备DataFrame
+df = pd.DataFrame()
+df['Load_A'] = df_load['园区A负荷(kW)']
+df['Load_B'] = df_load['园区B负荷(kW)']
+df['Load_C'] = df_load['园区C负荷(kW)']
+df['PV_A_pu'] = pd.to_numeric(df_gen_pu[1])
+df['Wind_B_pu'] = pd.to_numeric(df_gen_pu[2])
+df['PV_C_pu'] = pd.to_numeric(df_gen_pu[3])
+df['Wind_C_pu'] = pd.to_numeric(df_gen_pu[4])
+
+# --- 3. 计算基础数据 (净负荷) ---
+df['Gen_A'] = df['PV_A_pu'] * CAP_PV_A
+df['Net_Load_A'] = df['Load_A'] - df['Gen_A']
+df['Gen_B'] = df['Wind_B_pu'] * CAP_Wind_B
+df['Net_Load_B'] = df['Load_B'] - df['Gen_B']
+df['Gen_PV_C'] = df['PV_C_pu'] * CAP_PV_C
+df['Gen_Wind_C'] = df['Wind_C_pu'] * CAP_Wind_C
+df['Gen_C_Total'] = df['Gen_PV_C'] + df['Gen_Wind_C']
+df['Net_Load_C'] = df['Load_C'] - df['Gen_C_Total']
 zero_series = pd.Series(np.zeros(24))
 
 
-# --- 3. 核心函数 ---
-
-def capital_recovery_factor(r, n):
-    """ 计算年金现值 (资本回收系数) (对应模型 [91b...]) """
-    if r == 0: return 1 / n
-    return (r * (1 + r) ** n) / ((1 + r) ** n - 1)
-
-
-# --- *** 关键修正： analyze_doc_with_tou (忠实于模型 [d61...]) *** ---
-def analyze_doc_with_tou(load_series, pv_gen_series, wind_gen_series, p_cap, e_cap):
+# --- 4. 关键函数：(已修正 UnboundLocalError) ---
+def analyze_doc_with_storage(load_series, pv_gen_series, wind_gen_series, p_cap, e_cap):
     """
-    (模型五的核心)
-    在“分时电价”下计算日运行成本(DOC) - 采用修正后的正确套利逻辑
+    计算给定(P, E)配置下的“日运行成本(DOC)”。
     """
     p_es = p_cap;
     e_es = e_cap;
@@ -70,18 +70,19 @@ def analyze_doc_with_tou(load_series, pv_gen_series, wind_gen_series, p_cap, e_c
     soc_max = e_es * 0.9;
     eta = 0.95
     gen_total_series = pv_gen_series + wind_gen_series
+    net_load_series = load_series - gen_total_series  # (已移到 if 之外)
 
     # --- “无储能”分支 (P=0 or E=0) ---
     if e_es <= 0 or p_es <= 0:
-        net_load_series = load_series - gen_total_series
-        grid_buy_cost = 0.0
+        grid_buy = np.zeros(24)
         curtail = np.zeros(24);
         pv_used = np.zeros(24);
         wind_used = np.zeros(24)
+
         for t in range(24):
             net_load = net_load_series[t]
             if net_load > 0:
-                grid_buy_cost += net_load * TOU_PRICE_ARRAY[t]  # [cite: 67]
+                grid_buy[t] = net_load
             else:
                 curtail[t] = -net_load
             ren_used_t = gen_total_series[t] - curtail[t]
@@ -95,231 +96,213 @@ def analyze_doc_with_tou(load_series, pv_gen_series, wind_gen_series, p_cap, e_c
             pv_used[t] = ren_used_t * ratio_pv_t;
             wind_used[t] = ren_used_t * ratio_wind_t
 
-        # 严格按照题目，弃电成本为0 (没有惩罚)
-        doc = grid_buy_cost + (pv_used.sum() * PRICE_PV_OP) + (wind_used.sum() * PRICE_WIND_OP)
-        return doc
+        doc = (grid_buy.sum() * PRICE_GRID) + (pv_used.sum() * PRICE_PV) + (wind_used.sum() * PRICE_Wind)
+        return {"doc": doc, "grid_buy": grid_buy.sum(), "curtail": curtail.sum()}
 
-    # --- “有储能”分支 (套利逻辑) ---
+    # --- “有储能”分支 ---
     soc = np.zeros(25);
     soc[0] = soc_min
-    grid_buy_cost = 0.0  # 从电网购买的总 *成本*
-    pv_used_cost = 0.0  # 使用光伏的总 *成本*
-    wind_used_cost = 0.0  # 使用风电的总 *成本*
+    p_charge = np.zeros(24);
+    p_discharge = np.zeros(24)
+    grid_buy_new = np.zeros(24);
     curtail_new = np.zeros(24)
+    pv_used_new = np.zeros(24);
+    wind_used_new = np.zeros(24)
 
     for t in range(24):
-        # 1. 初始化本小时数据
-        p_load = load_series[t]
-        p_pv = pv_gen_series[t]
-        p_wind = wind_gen_series[t]
-        p_ren_total = p_pv + p_wind
-        price = TOU_PRICE_ARRAY[t]
+        net_load = net_load_series[t]
+        if net_load > 0:
+            max_can_discharge = min(p_es, (soc[t] - soc_min) * eta)
+            p_discharge[t] = min(max_can_discharge, net_load)
+            grid_buy_new[t] = net_load - p_discharge[t]
+        elif net_load < 0:
+            surplus = -net_load
+            max_can_charge = min(p_es, (soc_max - soc[t]) / eta)
+            p_charge[t] = min(max_can_charge, surplus)
+            curtail_new[t] = surplus - p_charge[t]
+        soc[t + 1] = soc[t] - (p_discharge[t] / eta) + (p_charge[t] * eta)
 
-        p_charge = 0.0
-        p_discharge = 0.0
+        pv_gen_t = pv_gen_series[t];
+        wind_gen_t = wind_gen_series[t];
+        gen_total_t = pv_gen_t + wind_gen_t
+        ren_used_t = gen_total_t - curtail_new[t]
+        if gen_total_t > 0:
+            ratio_pv_t = pv_gen_t / gen_total_t; ratio_wind_t = wind_gen_t / gen_total_t
+        else:
+            ratio_pv_t = 0.0; ratio_wind_t = 0.0
+        pv_used_new[t] = ren_used_t * ratio_pv_t;
+        wind_used_new[t] = ren_used_t * ratio_wind_t
 
-        # 2. 优先：可再生能源满足负荷
-        ren_to_load = min(p_load, p_ren_total)
-        p_load_remaining = p_load - ren_to_load  # 负荷剩余缺口
-        p_ren_surplus = p_ren_total - ren_to_load  # 可再生能源剩余
-
-        if p_ren_total > 0:
-            pv_used_cost += (ren_to_load * (p_pv / p_ren_total)) * PRICE_PV_OP
-            wind_used_cost += (ren_to_load * (p_wind / p_ren_total)) * PRICE_WIND_OP
-
-        # 3. 储能决策 (套利)
-
-        # 3.1 峰时 (Price = 1.0): 优先放电
-        if price == 1.0:
-            if p_load_remaining > 0:  # 负荷仍有缺口
-                max_can_discharge = min(p_es, (soc[t] - soc_min) * eta)
-                p_discharge = min(max_can_discharge, p_load_remaining)
-                p_load_remaining -= p_discharge  # 储能满足部分负荷
-
-        # 3.2 谷时 (Price = 0.4): 优先充电
-        elif price == 0.4:
-            # 3.2.1 谷时 + 弃电: 优先用免费的弃电充
-            if p_ren_surplus > 0:
-                max_can_charge_power = min(p_es, (soc_max - soc[t]) / eta)
-                p_charge_from_surplus = min(max_can_charge_power, p_ren_surplus)
-                p_charge += p_charge_from_surplus
-                p_ren_surplus -= p_charge_from_surplus
-
-            # 3.2.2 谷时 + 谷电套利: 再用便宜的谷电充
-            remaining_charge_power = p_es - p_charge
-            remaining_charge_capacity = (soc_max - (soc[t] + p_charge * eta)) / eta
-
-            if remaining_charge_power > 0 and remaining_charge_capacity > 0:
-                p_charge_from_grid = min(remaining_charge_power, remaining_charge_capacity)
-                p_charge += p_charge_from_grid
-                # 充电会增加负荷
-                p_load_remaining += p_charge_from_grid
-
-                # 3.3 平时 (Price = 1.0, 但无负荷): 也要充免费的弃电
-        if p_ren_surplus > 0 and p_charge < p_es:
-            remaining_charge_power = p_es - p_charge
-            remaining_charge_capacity = (soc_max - (soc[t] + p_charge * eta)) / eta
-            p_charge_from_surplus = min(remaining_charge_power, remaining_charge_capacity, p_ren_surplus)
-            p_charge += p_charge_from_surplus
-            p_ren_surplus -= p_charge_from_surplus
-
-        # 4. 结算
-        curtail_new[t] = p_ren_surplus
-        if p_load_remaining > 0:
-            grid_buy_cost += p_load_remaining * price
-        soc[t + 1] = soc[t] - (p_discharge / eta) + (p_charge * eta)
-
-    # --- 循环结束 ---
-    doc = grid_buy_cost + pv_used_cost + wind_used_cost
-    return doc
-
-
-# --- *** 修正结束 *** ---
-
-
-def calculate_annual_cost(pv_cap, w_cap, p_es, e_es, doc_daily):
-    """ (对应模型 [469...], [91b...]) """
-    # 1. 年运行成本 (Cop)
-    cost_op_annual = doc_daily * 365
-
-    # 2. 年化投资成本 (Cinv)
-    crf_gen = capital_recovery_factor(INTEREST_RATE, LIFESPAN_GEN)  # R1 (n=5)
-    crf_es = capital_recovery_factor(INTEREST_RATE, LIFESPAN_ES)  # R2 (n=10)
-
-    cost_inv_gen = (pv_cap * COST_PV_INV + w_cap * COST_WIND_INV)
-    cost_inv_es = (p_es * COST_P_ES + e_es * COST_E_ES)
-
-    cost_inv_annual = (cost_inv_gen * crf_gen) + (cost_inv_es * crf_es)
-
-    # 3. 年总成本 (F)
-    total_annual_cost = cost_op_annual + cost_inv_annual
-
-    return total_annual_cost, cost_op_annual, cost_inv_annual
-
-
-# --- 4. 核心：DE 算法的目标函数 (对应模型 [6ed...]) ---
-def objective_function_monthly(x, park_code, load_data_monthly, gen_data_monthly_raw):
-    """
-    x 是决策变量 [P_pv, P_w, P_bat, E_bat]
-    """
-    pv_cap, w_cap, p_es, e_es = x
-
-    if p_es < 1 or e_es < 1:
-        p_es, e_es = 0, 0
-
-    total_annual_op_cost = 0
-
-    # --- 循环 12 个月 (对应模型 [af4...]) ---
-    for m_idx, month in enumerate(range(1, 13)):
-        days = DAYS_IN_MONTH[m_idx]
-
-        # 1. 提取当月负荷
-        current_load = load_data_monthly[park_code]
-
-        # 2. 提取当月风光PU数据 (根据附件3  的列顺序)
-        col_idx_base = (m_idx * 4) + 1
-        col_A_pv = col_idx_base
-        col_B_w = col_idx_base + 1
-        col_C_w = col_idx_base + 2
-        col_C_pv = col_idx_base + 3
-
-        if park_code == 'A':
-            pv_pu = pd.to_numeric(gen_data_monthly_raw[col_A_pv])
-            wind_pu = zero_series
-        elif park_code == 'B':
-            pv_pu = zero_series
-            wind_pu = pd.to_numeric(gen_data_monthly_raw[col_B_w])
-        elif park_code == 'C':
-            pv_pu = pd.to_numeric(gen_data_monthly_raw[col_C_pv])
-            wind_pu = pd.to_numeric(gen_data_monthly_raw[col_C_w])
-
-        # 3. 计算当月实际发电量
-        current_pv_gen = pv_pu * pv_cap
-        current_wind_gen = wind_pu * w_cap
-
-        # 4. 运行“套利”模拟，得到当月典型日 DOC
-        doc_daily_m = analyze_doc_with_tou(
-            current_load, current_pv_gen, current_wind_gen, p_es, e_es
-        )
-
-        # 5. 累加年运行成本
-        total_annual_op_cost += doc_daily_m * days
-    # --- 12个月循环结束 ---
-
-    # 6. 计算年化投资成本 (C_inv)
-    crf_gen = capital_recovery_factor(INTEREST_RATE, LIFESPAN_GEN)
-    crf_es = capital_recovery_factor(INTEREST_RATE, LIFESPAN_ES)
-    cost_inv_gen = (pv_cap * COST_PV_INV + w_cap * COST_WIND_INV)
-    cost_inv_es = (p_es * COST_P_ES + e_es * COST_E_ES)
-    cost_inv_annual = (cost_inv_gen * crf_gen) + (cost_inv_es * crf_es)
-
-    # 7. 返回总目标：F = Cop + Cinv
-    F_total = total_annual_op_cost + cost_inv_annual
-
-    return F_total
-
-
-# --- 5. 主程序 ---
-if __name__ == "__main__":
-    print("--- 问题3(2) 考虑12个月和分时电价的协调配置 (忠实于A题参数) ---")
-    total_start_time = time.time()
-
-    # --- 搜索边界 (Bounds) ---
-    # [P_pv, P_w, P_bat, E_bat]
-    bounds_A = [(0, 1500), (0, 0), (0, 300), (0, 600)]  # A园区: 无风电
-    bounds_B = [(0, 0), (0, 2000), (0, 300), (0, 600)]  # B园区: 无光伏
-    bounds_C = [(0, 1500), (0, 1500), (0, 300), (0, 600)]  # C园区: 都有
-
-    # --- DE 算法的超参数 ---
-    de_params = {
-        'popsize': 15,
-        'maxiter': 100,  # (为节省时间，设为100)
-        'workers': -1,
-        'updating': 'deferred',
-        'disp': True,
-        'tol': 0.01
+    doc = (grid_buy_new.sum() * PRICE_GRID) + (pv_used_new.sum() * PRICE_PV) + (wind_used_new.sum() * PRICE_Wind)
+    return {
+        "doc": doc,
+        "grid_buy": grid_buy_new.sum(),
+        "curtail": curtail_new.sum()
     }
 
-    # --------------------------------
-    # (1) 独立运营 (逐个优化)
-    # --------------------------------
-    print("\n--- 正在优化 [独立运营] 方案 ---")
 
-    print("\n[园区A] (DE 运行中...)")
-    result_A = differential_evolution(objective_function_monthly, bounds_A,
-                                      args=('A', df_load, df_gen_monthly_raw),
-                                      **de_params)
+def calculate_dic(p_cap, e_cap):
+    """计算日均投资成本(DIC)"""
+    return (p_cap * COST_P_ES + e_cap * COST_E_ES) / LIFESPAN_DAYS
 
-    print("\n[园区B] (DE 运行中...)")
-    result_B = differential_evolution(objective_function_monthly, bounds_B,
-                                      args=('B', df_load, df_gen_monthly_raw),
-                                      **de_params)
 
-    print("\n[园区C] (DE 运行中...)")
-    result_C = differential_evolution(objective_function_monthly, bounds_C,
-                                      args=('C', df_load, df_gen_monthly_raw),
-                                      **de_params)
+# --- 5. 遍历搜索函数 ---
+def find_optimal_config(load_series, pv_gen_series, wind_gen_series, p_range, e_range):
+    results = []
+    for p in p_range:
+        for e in e_range:
+            sim_result = analyze_doc_with_storage(load_series, pv_gen_series, wind_gen_series, p, e)
+            doc = sim_result['doc']
+            dic = calculate_dic(p, e)
+            tdc = doc + dic
+            results.append({
+                'P_cap': p, 'E_cap': e, 'TDC': tdc, 'DOC': doc, 'DIC': dic,
+                'Grid_Buy': sim_result['grid_buy'],
+                'Curtail': sim_result['curtail']
+            })
+    df_results = pd.DataFrame(results)
+    optimal_config = df_results.loc[df_results['TDC'].idxmin()]
+    return optimal_config
 
-    # --------------------------------
-    # (2) 打印结果
-    # --------------------------------
+
+# --- 6. 主程序 ---
+if __name__ == "__main__":
+
+    print("--- 问题1(3) 最优储能配置分析 ---")
+    total_start_time = time.time()
+    P_range = np.arange(0, 151, 10)
+    E_range = np.arange(0, 301, 20)
+
+    # (1) 计算 (P=0, E=0) 基准方案
+    print("\n--- 正在计算 (P=0, E=0) 基准方案的TDC... ---")
+    baseline_A_result = analyze_doc_with_storage(df['Load_A'], df['Gen_A'], zero_series, 0, 0)
+    tdc_A_baseline = baseline_A_result['doc']
+    baseline_B_result = analyze_doc_with_storage(df['Load_B'], zero_series, df['Gen_B'], 0, 0)
+    tdc_B_baseline = baseline_B_result['doc']
+    baseline_C_result = analyze_doc_with_storage(df['Load_C'], df['Gen_PV_C'], df['Gen_Wind_C'], 0, 0)
+    tdc_C_baseline = baseline_C_result['doc']
+
+    # (2) 计算 (50, 100) 固定方案
+    print("正在计算 50kW/100kWh 方案的TDC...")
+    dic_50 = calculate_dic(50, 100)
+    doc_A_50 = analyze_doc_with_storage(df['Load_A'], df['Gen_A'], zero_series, 50, 100)['doc']
+    tdc_A_50 = doc_A_50 + dic_50
+    doc_B_50 = analyze_doc_with_storage(df['Load_B'], zero_series, df['Gen_B'], 50, 100)['doc']
+    tdc_B_50 = doc_B_50 + dic_50
+    doc_C_50 = analyze_doc_with_storage(df['Load_C'], df['Gen_PV_C'], df['Gen_Wind_C'], 50, 100)['doc']
+    tdc_C_50 = doc_C_50 + dic_50
+    print(f"园区A (50/100) TDC: {tdc_A_50:,.2f} 元")
+    print(f"园区B (50/100) TDC: {tdc_B_50:,.2f} 元")
+    print(f"园区C (50/100) TDC: {tdc_C_50:,.2f} 元")
+
+    # (3) 寻找最优解
+    print(f"\n正在执行遍历搜索 (P: {len(P_range)} 步, E: {len(E_range)} 步)...")
+    print("\n--- 正在优化 园区A ---")
+    start_A = time.time()
+    optimal_A = find_optimal_config(df['Load_A'], df['Gen_A'], zero_series, P_range, E_range)
+    print(f"搜索完成！用时 {time.time() - start_A:.2f} 秒")
+    print("\n--- 正在优化 园区B ---")
+    start_B = time.time()
+    optimal_B = find_optimal_config(df['Load_B'], zero_series, df['Gen_B'], P_range, E_range)
+    print(f"搜索完成！用时 {time.time() - start_B:.2f} 秒")
+    print("\n--- 正在优化 园区C ---")
+    start_C = time.time()
+    optimal_C = find_optimal_config(df['Load_C'], df['Gen_PV_C'], df['Gen_Wind_C'], P_range, E_range)
+    print(f"搜索完成！用时 {time.time() - start_C:.2f} 秒")
+
+    # (4) 打印最终的优化结果报告
     print("\n\n" + "=" * 30)
-    print("--- 问题3(2) 最终配置结果 ---")
+    print("--- 最终优化结果报告 ---")
     print("=" * 30)
+    # (省略... 打印逻辑与之前相同)
+    print(f"\n[园区A 最优配置方案]")
+    print(f"最优功率: {optimal_A['P_cap']} kW, 最优容量: {optimal_A['E_cap']} kWh")
+    print(f"最低总成本 TDC: {optimal_A['TDC']:,.2f} 元")
+    print(f" (其中 DOC: {optimal_A['DOC']:,.2f} 元, DIC: {optimal_A['DIC']:,.2f} 元)")
+    print(f" (最优方案详情: 购电 {optimal_A['Grid_Buy']:,.2f} kWh, 弃电 {optimal_A['Curtail']:,.2f} kWh)")
+    print(f"[论证 50/100 方案]: {tdc_A_50:,.2f} 元 >= 最优方案 {optimal_A['TDC']:,.2f} 元。")  # (修正了比较符)
+    if tdc_A_50 >= optimal_A['TDC']:
+        print("结论：50/100 方案不是最优方案 (或与最优方案相同)。")
+    else:
+        print("结论：50/100 方案在搜索范围内是最优方案。")
+    print(f"\n[园区B 最优配置方案]")
+    print(f"最优功率: {optimal_B['P_cap']} kW, 最优容量: {optimal_B['E_cap']} kWh")
+    print(f"最低总成本 TDC: {optimal_B['TDC']:,.2f} 元")
+    print(f" (其中 DOC: {optimal_B['DOC']:,.2f} 元, DIC: {optimal_B['DIC']:,.2f} 元)")
+    print(f" (最优方案详情: 购电 {optimal_B['Grid_Buy']:,.2f} kWh, 弃电 {optimal_B['Curtail']:,.2f} kWh)")
+    print(f"[论证 50/100 方案]: {tdc_B_50:,.2f} 元 >= 最优方案 {optimal_B['TDC']:,.2f} 元。")
+    if tdc_B_50 >= optimal_B['TDC']:
+        print("结论：50/100 方案不是最优方案 (或与最优方案相同)。")
+    else:
+        print("结论：50/100 方案在搜索范围内是最优方案。")
+    print(f"\n[园区C 最优配置方案]")
+    print(f"最优功率: {optimal_C['P_cap']} kW, 最优容量: {optimal_C['E_cap']} kWh")
+    print(f"最低总成本 TDC: {optimal_C['TDC']:,.2f} 元")
+    print(f" (其中 DOC: {optimal_C['DOC']:,.2f} 元, DIC: {optimal_C['DIC']:,.2f} 元)")
+    print(f" (最优方案详情: 购电 {optimal_C['Grid_Buy']:,.2f} kWh, 弃电 {optimal_C['Curtail']:,.2f} kWh)")
+    print(f"[论证 50/100 方案]: {tdc_C_50:,.2f} 元 >= 最优方案 {optimal_C['TDC']:,.2f} 元。")
+    if tdc_C_50 >= optimal_C['TDC']:
+        print("结论：50/100 方案不是最优方案 (或与最优方案相同)。")
+    else:
+        print("结论：50/100 方案在搜索范围内是最优方案。")
+    print(f"\n--- 总用时: {time.time() - total_start_time:.2f} 秒 ---")
 
-    (pv_A, w_A, p_bat_A, e_bat_A) = result_A.x
-    F_A = result_A.fun
 
-    (pv_B, w_B, p_bat_B, e_bat_B) = result_B.x
-    F_B = result_B.fun
+    # ----------------------------------------------------
+    # (5) (!! 已修改 !!) 可视化图表
+    # ----------------------------------------------------
+    def plot_optimal_comparison(baseline_costs, fixed_costs, optimal_costs):
+        parks = ['园区A', '园区B', '园区C']
+        data = {
+            '基准 (无储能)': baseline_costs,
+            '50/100 方案': fixed_costs,
+            '最优储能方案': optimal_costs
+        }
 
-    (pv_C, w_C, p_bat_C, e_bat_C) = result_C.x
-    F_C = result_C.fun
+        x = np.arange(len(parks))
+        width = 0.25
+        multiplier = 0
 
-    print(f"\n[独立运营 最优配置] (总用时: {time.time() - total_start_time:.2f} s)")
-    print(f" 园区A: P_pv={pv_A:.2f} kW, P_w={w_A:.2f} kW, P_bat={p_bat_A:.2f} kW, E_bat={e_bat_A:.2f} kWh")
-    print(f"      年总成本 (F_A): {F_A:,.2f} 元")
-    print(f" 园区B: P_pv={pv_B:.2f} kW, P_w={w_B:.2f} kW, P_bat={p_bat_B:.2f} kW, E_bat={e_bat_B:.2f} kWh")
-    print(f"      年总成本 (F_B): {F_B:,.2f} 元")
-    print(f" 园区C: P_pv={pv_C:.2f} kW, P_w={w_C:.2f} kW, P_bat={p_bat_C:.2f} kW, E_bat={e_bat_C:.2f} kWh")
-    print(f"      年总成本 (F_C): {F_C:,.2f} 元")
+        try:
+            fig, ax = plt.subplots(layout='constrained')
+            colors = ['salmon', 'cornflowerblue', 'forestgreen']
+            i = 0
+
+            for scenario, costs in data.items():
+                offset = width * multiplier
+                rects = ax.bar(x + offset, costs, width, label=scenario, color=colors[i])
+                ax.bar_label(rects, padding=3, fmt='%.0f', rotation=90, fontsize=8)
+                multiplier += 1
+                i += 1
+
+            ax.set_ylabel('总成本 (TDC) (元)')
+            ax.set_title('问题1(3): 各园区三种储能方案的总成本对比')
+            ax.set_xticks(x + width, parks)
+            ax.legend(loc='upper right', ncols=1)  # 修改图例位置
+
+            # --- *** 关键修正 *** ---
+            # 动态计算Y轴范围，实现“放大”
+            all_costs = baseline_costs + fixed_costs + optimal_costs
+            min_val = min(all_costs)
+            max_val = max(all_costs)
+            padding = (max_val - min_val) * 0.1  # 10% 的上下留白
+
+            # 设置Y轴的下限和上限
+            ax.set_ylim(bottom=min_val - padding, top=max_val + padding)
+            # --- *** 修正结束 *** ---
+
+            plt.savefig("plot_Q1_3_optimal_comparison.png")
+            print("\n--- 可视化图表已生成 (已优化Y轴) ---")
+            print("已保存 'plot_Q1_3_optimal_comparison.png'")
+
+        except Exception as e:
+            print(f"\n--- 可视化图表生成失败 ---")
+            print(f"错误: {e}")
+
+
+    # 整理数据并调用
+    baseline_tdcs = [tdc_A_baseline, tdc_B_baseline, tdc_C_baseline]
+    fixed_tdcs = [tdc_A_50, tdc_B_50, tdc_C_50]
+    optimal_tdcs = [optimal_A['TDC'], optimal_B['TDC'], optimal_C['TDC']]
+
+    plot_optimal_comparison(baseline_tdcs, fixed_tdcs, optimal_tdcs)
